@@ -7,7 +7,7 @@ import Server
 
 /// A trusted, explicitly configured server-side capability invocation facade.
 /// Publication is opt-in per route; it does not change Agent availability or visibility.
-public struct CapabilityAPI {
+public struct CapabilityAPI: Sendable {
     public let dispatcher: CapabilityDispatcher
     public let authority: BearerAuthority
 
@@ -49,6 +49,32 @@ public enum CapabilityRoute {
             self.status = status
             self.output = output
         }
+
+        /// The transport status is derived from the execution outcome; the
+        /// returned JSON envelope contains no checkpoint or internal trace.
+        /// HTTPRespondable requires response(status:); Route.typed calls the
+        /// protocol's no-argument convenience, which delegates here.
+        public func response(status _: HTTPStatus) throws -> HTTPResponse {
+            let mappedStatus: HTTPStatus
+            switch status {
+            case "succeeded":
+                mappedStatus = .ok
+            case "suspended":
+                mappedStatus = .accepted
+            case "failed":
+                mappedStatus = .internalServerError
+            case "invalid_input":
+                mappedStatus = .badRequest
+            default:
+                mappedStatus = .internalServerError
+            }
+            // The two-argument Returnable helper performs JSON serialization.
+            // This is NOT the HTTPRespondable witness, so it cannot recurse.
+            return try response(
+                status: mappedStatus,
+                using: HTTPJSONCoding.current.encoder()
+            )
+        }
     }
 
     public struct Request: Requestable {
@@ -75,6 +101,53 @@ public enum CapabilityRoute {
         }
     }
 
+    /// Translate native outcomes without exposing internal records or checkpoints.
+    /// A successful response must satisfy the selected capability's output type.
+    public static func respond<C: Capability>(
+        to outcome: CapabilityInvocation.Outcome,
+        reference: CapabilityReference,
+        capability _: C.Type
+    ) throws -> Response {
+        guard reference == C.reference else {
+            throw CapabilityRouteError.mismatchedOutcome(reference)
+        }
+        switch outcome {
+        case .program(let record):
+            guard case .program = reference else {
+                throw CapabilityRouteError.mismatchedOutcome(reference)
+            }
+            guard case .program(let identifier) = reference,
+                  record.programIdentifier == identifier else {
+                throw CapabilityRouteError.mismatchedOutcome(reference)
+            }
+            switch record.outcome {
+            case .succeeded:
+                guard let output = record.output else {
+                    throw CapabilityRouteError.mismatchedOutcome(reference)
+                }
+                _ = try JSONCoding.default.decode(C.Output.self, from: output)
+                return Response(status: "succeeded", output: output)
+            case .suspended:
+                return Response(status: "suspended", output: nil)
+            case .failed:
+                return Response(status: "failed", output: nil)
+            }
+        case .inference(let result):
+            guard case .inference = reference else {
+                throw CapabilityRouteError.mismatchedOutcome(reference)
+            }
+            guard case .inference(let identifier) = reference,
+                  result.record.inference == identifier else {
+                throw CapabilityRouteError.mismatchedOutcome(reference)
+            }
+            let output = try JSONDecoder().decode(JSONValue.self, from: result.output)
+            _ = try JSONCoding.default.decode(C.Output.self, from: output)
+            return Response(status: "succeeded", output: output)
+        case .tool, .agent:
+            throw CapabilityRouteError.mismatchedOutcome(reference)
+        }
+    }
+
     public static func make<C: Capability>(
         _ endpoint: HTTPEndpoint,
         capability _: C.Type,
@@ -85,26 +158,23 @@ public enum CapabilityRoute {
         return Route.typed(
             endpoint,
             request: Request.self
-        ) { request, _ in
-            // Validate the incoming JSON against the actual typed input model.
-            _ = try JSONCoding.default.decode(C.Input.self, from: request.input)
-            let invocation = try invocation(for: reference, input: request.input)
-            let outcome = try await dispatcher.invoke(invocation, origin: .host)
-            switch outcome {
-            case .program(let record):
-                guard case .program = reference else {
-                    throw CapabilityRouteError.mismatchedOutcome(reference)
-                }
-                return Response(status: record.outcome.rawValue, output: record.output)
-            case .inference(let result):
-                guard case .inference = reference else {
-                    throw CapabilityRouteError.mismatchedOutcome(reference)
-                }
-                let output = try JSONDecoder().decode(JSONValue.self, from: result.output)
-                return Response(status: "succeeded", output: output)
-            case .tool, .agent:
-                throw CapabilityRouteError.mismatchedOutcome(reference)
+        ) { request, _ -> Response in
+            // Input decoding is client validation, not an internal execution failure.
+            let typedInput: C.Input
+            do {
+                typedInput = try JSONCoding.default.decode(
+                    C.Input.self,
+                    from: request.input
+                )
+            } catch {
+                return Response(status: "invalid_input", output: nil)
             }
+
+            // Dispatch the successfully decoded typed value, not unchecked wire JSON.
+            let input = try JSONCoding.default.value(typedInput)
+            let invocation = try invocation(for: reference, input: input)
+            let outcome = try await dispatcher.invoke(invocation, origin: .host)
+            return try respond(to: outcome, reference: reference, capability: C.self)
         }
         .use(BearerAuthorityMiddleware(authority: api.authority))
     }

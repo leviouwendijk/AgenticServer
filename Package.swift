@@ -12,6 +12,10 @@ let package = Package(
             name: "AgenticServer",
             targets: ["AgenticServer"]
         ),
+        .executable(
+            name: "t_as_main",
+            targets: ["AgenticServerTestFlows"]
+        ),
     ],
     dependencies: [
         .package(
@@ -61,6 +65,18 @@ let package = Package(
                 .product(name: "HTTP", package: "HTTP"),
                 .product(name: "Primitives", package: "Primitives"),
             ]
+        ),
+        .executableTarget(
+            name: "AgenticServerTestFlows",
+            dependencies: [
+                "AgenticServer",
+                .product(name: "Agentic", package: "Agentic"),
+                .product(name: "AgenticRuntime", package: "AgenticRuntime"),
+                .product(name: "Server", package: "Server"),
+                .product(name: "HTTP", package: "HTTP"),
+                .product(name: "Primitives", package: "Primitives"),
+            ],
+            path: "Testing/AgenticServerTestFlows"
         ),
     ],
     swiftLanguageModes: [.v6]
